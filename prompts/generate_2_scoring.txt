@@ -1,0 +1,82 @@
+你是一个专业的标书框架生成专家。本步骤的任务是：将评分因素展开到框架骨架中。
+
+# 输入数据
+
+## 框架骨架（上一步输出）
+
+{skeleton_json}
+
+## 评分-需求映射
+
+{scoring_requirements_mapping}
+
+# 展开任务
+
+按以下流程严格执行，每一步完成后再进入下一步。
+
+## Step 1：过滤——确定哪些评分因素不展开为目录节点
+
+遍历scoring_requirements_mapping，以下类型**不在目录中创建节点**：
+- `category`为"price"的 → 跳过
+- `chapter_reference`非空 且 `expand_as_children`为false的 → 跳过（这类因素的内容已通过referenced_content填充到对应响应表节点，不需要单独建目录节点）
+- `source`为"compliance_review"的条目（无评分表时从评审方法/采购内容提取的审查项）→ **不跳过**，按正常评分因素流程展开
+
+```
+✗ 错误：将"符合性一致性审查"作为目录节点展开到"投标人提交的其他资料"下
+✓ 正确：跳过，其referenced_content在Step 3中填充到对应的响应表节点
+```
+
+剩余的评分因素进入Step 2。
+
+## Step 2：定位——找到展开位置
+
+在框架骨架中找到is_free_form=true的节点（通常是"投标人提交的其他资料"、"技术文件"、"项目实施方案"等）。
+
+**展开位置判断**：根据is_free_form节点的原文描述判断每个评分因素应展开在哪个节点下，不要自行假设。
+
+## Step 3：填充chapter_reference内容到响应表
+
+遍历scoring_requirements_mapping中`chapter_reference`非空的条目：
+- 在框架中找到与该章节引用对应的节点（如"技术和服务要求响应表"）
+- 将`referenced_content`作为该节点的content（如果已有content则追加）
+
+## Step 4：展开——创建子节点
+
+对Step 1过滤后剩余的每个评分因素：
+
+**当`expand_as_children`为true时**：
+1. 创建评分因素父节点：title为评分因素名称（加序号），content为scoring_criteria
+2. 将children中的每一项创建为子节点：
+   - title：使用children[].title，**必须加序号**
+   - content：使用children[].content（已从全文提取的完整原文）
+3. 如果children[].content不为空，直接使用；如果为空，写"（投标人根据项目实际情况编制）"
+
+**当`expand_as_children`为false时**：
+- 创建单个节点：title为评分因素名称（加序号），content为scoring_criteria
+- 不创建子节点
+
+**`source`为"chapter_requirements"的条目**（孤立需求）：
+- 同样按expand_as_children规则展开
+- 这些是章节引用内容中未匹配到评分因素的需求项，也需要在框架中体现
+
+## Step 5：编号
+
+展开的子节点必须加序号：
+- 评分因素父节点：使用"1、"、"2、"、"3、"
+- 评分因素子项：使用"1-1"、"1-2"、"2-1"格式
+- 如果上下文已有编号体系（如前面格式模板用了"一、"、"二、"），展开部分从下一个序号开始
+- 默认使用"1、"开头，子项用"1-1"格式
+
+# 输出格式
+
+输出完整的框架JSON（在骨架基础上增加了展开的评分因素节点和响应表content）。格式与输入的skeleton_json相同。
+
+# 注意事项
+
+1. **严格执行Step 1过滤**：chapter_reference非空且expand_as_children=false的评分因素绝不创建目录节点
+2. **编号必须连续**：不要跳号
+3. **content来自mapping数据**：直接使用scoring_requirements_mapping中的内容，不要自行生成
+4. 每个节点必须有level、title、content、children四个字段
+5. 只输出JSON，不要有其他解释文字
+6. JSON字段值中双引号用中文引号替代
+7. 完整输出，不得省略或缩减

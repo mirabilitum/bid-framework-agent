@@ -22,9 +22,16 @@ from typing import Optional, List, Dict, Any
 class BaseLLMProvider(ABC):
     """Abstract base for all LLM providers."""
 
+    max_input_chars: int = 30000  # default, subclasses override
+
     @abstractmethod
     def generate(self, prompt: str, max_tokens: int = 4096, **kwargs) -> str:
-        """Send a text prompt and return the model response."""
+        """Send a text prompt and return the model response.
+
+        Optional kwargs:
+            system: str — system prompt. ClaudeProvider caches this for
+                    repeated calls, saving up to 90% input token cost.
+        """
 
     def generate_with_images(
         self, prompt: str, images: Optional[List[dict]] = None, max_tokens: int = 4096, **kwargs
@@ -38,9 +45,12 @@ class BaseLLMProvider(ABC):
 # --------------------------------------------------------------------------- #
 
 class ClaudeProvider(BaseLLMProvider):
-    """Anthropic Claude provider with vision support."""
+    """Anthropic Claude provider with vision, streaming, and prompt caching."""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-20250514"):
+    max_input_chars = 80000  # ~100k token context
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-20250514",
+                 base_url: Optional[str] = None):
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -49,27 +59,59 @@ class ClaudeProvider(BaseLLMProvider):
                 "  Or pass:     --api-key sk-ant-..."
             )
         self.model = model
+        self.base_url = base_url
+        self._client = None  # lazy init, reused for prompt cache hits
+
+    def _get_client(self):
+        """Get or create the Anthropic client (reused across calls for cache hits)."""
+        if self._client is None:
+            import anthropic
+            client_kwargs = {"api_key": self.api_key}
+            if self.base_url:
+                client_kwargs["base_url"] = self.base_url
+            self._client = anthropic.Anthropic(**client_kwargs)
+        return self._client
 
     def generate(self, prompt: str, max_tokens: int = 4096, **kwargs) -> str:
-        import anthropic
+        """Generate with streaming + prompt caching.
 
-        client = anthropic.Anthropic(api_key=self.api_key)
-        resp = client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        Pass system='...' to put shared context (e.g. document text) in a
+        cached system prompt. Subsequent calls with the same system text
+        hit the cache → ~90% cheaper input tokens.
+        """
+        client = self._get_client()
+        system_text = kwargs.get("system")
+
+        create_kwargs = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        # Prompt caching: put shared context in system with cache_control
+        if system_text:
+            create_kwargs["system"] = [{
+                "type": "text",
+                "text": system_text,
+                "cache_control": {"type": "ephemeral"},
+            }]
+
+        # Use streaming to prevent timeout on large outputs
+        with client.messages.stream(**create_kwargs) as stream:
+            resp = stream.get_final_message()
+        if not resp.content:
+            raise RuntimeError(f"Claude returned empty content. stop_reason={resp.stop_reason!r}")
         return resp.content[0].text
 
     def generate_with_images(
         self, prompt: str, images: Optional[List[dict]] = None, max_tokens: int = 4096, **kwargs
     ) -> str:
         if not images:
-            return self.generate(prompt, max_tokens=max_tokens)
+            return self.generate(prompt, max_tokens=max_tokens, **kwargs)
 
-        import anthropic
+        client = self._get_client()
+        system_text = kwargs.get("system")
 
-        client = anthropic.Anthropic(api_key=self.api_key)
         content: List[Dict[str, Any]] = []
         for img in images:
             content.append({
@@ -78,11 +120,23 @@ class ClaudeProvider(BaseLLMProvider):
             })
         content.append({"type": "text", "text": prompt})
 
-        resp = client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": content}],
-        )
+        create_kwargs = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": content}],
+        }
+
+        if system_text:
+            create_kwargs["system"] = [{
+                "type": "text",
+                "text": system_text,
+                "cache_control": {"type": "ephemeral"},
+            }]
+
+        with client.messages.stream(**create_kwargs) as stream:
+            resp = stream.get_final_message()
+        if not resp.content:
+            raise RuntimeError(f"Claude returned empty content. stop_reason={resp.stop_reason!r}")
         return resp.content[0].text
 
 
@@ -91,22 +145,68 @@ class ClaudeProvider(BaseLLMProvider):
 # --------------------------------------------------------------------------- #
 
 class OpenAIProvider(BaseLLMProvider):
-    """OpenAI GPT provider."""
+    """OpenAI GPT provider (also works with custom base_url for compatible APIs)."""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
+    max_input_chars = 50000  # ~128k token context
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o",
+                 base_url: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
+        self.base_url = base_url
+
+        if not self.api_key and not self.base_url:
             raise ValueError(
                 "OpenAI API key not found.\n"
                 "  Set env var: export OPENAI_API_KEY=sk-...\n"
                 "  Or pass:     --api-key sk-..."
             )
-        self.model = model
+
+        # Local models (Ollama etc.) don't need a real key
+        if not self.api_key:
+            self.api_key = "local"
+
+        # Auto-detect model for local APIs when no model specified
+        if model is not None:
+            self.model = model
+        elif self.base_url:
+            self.model = self._auto_detect_model()
+        else:
+            self.model = model
+
+    def _auto_detect_model(self) -> str:
+        """Auto-detect available model from local API (Ollama, LM Studio, etc.)."""
+        import urllib.request
+        # Try Ollama native endpoint first
+        ollama_base = self.base_url.replace("/v1", "").rstrip("/")
+        try:
+            req = urllib.request.Request(f"{ollama_base}/api/tags")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                models = data.get("models", [])
+                if models:
+                    return models[0].get("name", "default")
+        except Exception:
+            pass
+        # Try OpenAI-compatible /v1/models endpoint
+        try:
+            req = urllib.request.Request(f"{self.base_url}/models")
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                items = data.get("data", [])
+                if items:
+                    return items[0].get("id", "default")
+        except Exception:
+            pass
+        return "default"
 
     def generate(self, prompt: str, max_tokens: int = 4096, **kwargs) -> str:
         import openai
 
-        client = openai.OpenAI(api_key=self.api_key)
+        client_kwargs = {"api_key": self.api_key}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        client = openai.OpenAI(**client_kwargs)
         resp = client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
@@ -133,6 +233,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             OPENAI_COMPATIBLE_MODEL     (optional)  e.g. moonshot-v1-128k
     """
 
+    max_input_chars = 50000  # varies by model, safe default
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -157,7 +259,11 @@ class OpenAICompatibleProvider(BaseLLMProvider):
     def generate(self, prompt: str, max_tokens: int = 4096, **kwargs) -> str:
         import openai
 
-        client = openai.OpenAI(api_key=self.api_key or "not-needed", base_url=self.base_url)
+        client = openai.OpenAI(
+            api_key=self.api_key or "not-needed",
+            base_url=self.base_url,
+            timeout=300.0,
+        )
         resp = client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
@@ -172,6 +278,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
 
 class QwenProvider(BaseLLMProvider):
     """Alibaba Qwen provider via DashScope-compatible API."""
+
+    max_input_chars = 25000  # ~32k token context
 
     def __init__(self, api_key: Optional[str] = None, endpoint: Optional[str] = None):
         self.api_key = api_key or os.getenv("QWEN_API_KEY")
@@ -195,6 +303,7 @@ class QwenProvider(BaseLLMProvider):
                 "input": {"messages": [{"role": "user", "content": prompt}]},
                 "parameters": {"max_tokens": max_tokens},
             },
+            timeout=120,
         )
         resp.raise_for_status()
         return resp.json()["output"]["text"]
