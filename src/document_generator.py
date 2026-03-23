@@ -9,6 +9,7 @@ Supports:
 """
 
 import json
+import logging
 import re
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -31,6 +32,8 @@ class DocumentGenerator:
 
     # Regex for 【xxx】 section headers in content
     _SECTION_HEADER_RE = re.compile(r'^【.+?】.*$')
+
+    _logger = logging.getLogger(__name__)
 
     def generate(self, framework_nodes: Any, output_path: str, project_name: str = "") -> None:
         """
@@ -90,12 +93,17 @@ class DocumentGenerator:
                 self._add_node(doc, node)
 
         doc.save(output_path)
-        print(f"  [OK] Word document saved: {output_path}")
+        self._logger.info("Word document saved: %s", output_path)
 
     def generate_from_file(self, json_path: str, output_path: str, project_name: str = "") -> None:
         """Load framework JSON file and generate Word document."""
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Framework JSON not found: {json_path}") from None
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {json_path}: {exc}") from exc
         self.generate_from_json(data, output_path, project_name)
 
     # --- internal helpers ---

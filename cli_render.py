@@ -8,9 +8,12 @@ Usage:
 """
 import sys
 import os
+import logging
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
+
+logging.basicConfig(level=logging.INFO, format="  %(message)s")
 
 sys.path.insert(0, os.path.dirname(__file__))
 from src.document_generator import DocumentGenerator
