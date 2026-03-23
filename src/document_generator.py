@@ -498,13 +498,37 @@ class DocumentGenerator:
 
         doc.add_page_break()
 
+    @staticmethod
+    def _strip_title_from_content(title: str, content: str) -> str:
+        """Remove first line of content if it duplicates the node title.
+
+        Format templates often include the title as the first line of full_text
+        (e.g. '[CENTER]一、开标一览表'), which duplicates the node title rendered
+        by _add_node. This strips that first line to prevent double rendering.
+        """
+        if not content:
+            return content
+        lines = content.split('\n')
+        # Normalize for comparison: remove markers and punctuation
+        def _norm(s):
+            s = s.replace('[CENTER]', '').replace('[RIGHT]', '').strip()
+            # Remove common punctuation variants
+            for ch in '．.、，·':
+                s = s.replace(ch, '')
+            return s.replace(' ', '')
+        title_norm = _norm(title)
+        first_norm = _norm(lines[0])
+        if title_norm and first_norm and (title_norm in first_norm or first_norm in title_norm):
+            return '\n'.join(lines[1:]).lstrip('\n')
+        return content
+
     def _add_node(self, doc, node: Dict[str, Any], page_break: bool = False):
         """Recursively add framework node. Alignment/indent from content markers only."""
         from docx.shared import Inches, Cm, Pt, RGBColor
         from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
         title = node.get("title", "")
-        content = node.get("content", "")
+        content = self._strip_title_from_content(title, node.get("content", ""))
         children = node.get("children", [])
         paragraphs = node.get("paragraphs")
         level = node.get("level", 99)
