@@ -1,0 +1,125 @@
+{target_package_instruction}你是一个专业的招标文件分析专家。本步骤的任务是：对上一步的全文检索结果进行交叉填充和孤立需求识别。
+
+# 输入数据
+
+## 评分标准
+
+{scoring_factors}
+
+## 全文检索结果（上一步输出）
+
+{search_results}
+
+# 交叉填充任务
+
+## Step 1：拆解章节引用内容
+
+遍历search_results中所有`chapter_reference`非空的条目：
+1. 取出其`referenced_content`（引用章节的完整内容）
+2. 将其按原文编号拆解为结构化条目列表
+
+例如referenced_content为：
+```
+1.培训对象 ...内容...
+2.培训内容 ...内容...
+3.培训时间 ...内容...
+...
+8.培训效果评估及档案材料
+★8.1成交供应商须为每位学员免费提供学习资料...
+8.2相关要求...
+```
+→ 拆解为：`[{id:"1", title:"培训对象", content:"..."}, {id:"2", title:"培训内容", content:"..."}, ...]`
+
+## Step 2：交叉匹配
+
+将拆解出的条目与其他评分因素的children进行匹配：
+
+**匹配规则**：
+- 按关键词相似度匹配（如条目"培训后勤保障"匹配评分因素"培训后勤保障服务"的children）
+- 一个条目可以匹配多个评分因素子项（如"食宿安排"同时关联"饮食"和"住宿"）
+- 匹配成功 → 将条目内容**追加**到对应child的content中（不覆盖，追加在已有内容之后，用换行分隔）
+
+## Step 3：识别孤立需求
+
+拆解出的条目中，未能匹配到任何评分因素children的条目，标记为孤立需求。
+
+**孤立需求处理**：
+- 创建新的mapping条目，`source`标记为`"chapter_requirements"`
+- `expand_as_children`根据该条目是否有子级结构决定
+- 这些孤立需求在后续生成阶段也会作为框架节点展开
+
+# 输出格式
+
+输出完整的scoring_requirements_mapping（JSON数组），包含：
+1. search_results中的所有原始条目（children.content可能被交叉填充追加了内容）
+2. 新增的孤立需求条目（source为"chapter_requirements"）
+
+```json
+[
+  {
+    "scoring_factor": "培训机构管理",
+    "score": 3.0,
+    "category": "technical",
+    "expand_as_children": true,
+    "scoring_criteria": "评分细则原文",
+    "chapter_reference": "",
+    "referenced_content": "",
+    "source": "scoring_table",
+    "children": [
+      {
+        "title": "培训实施与管理",
+        "content": "（原始检索内容）\n\n（交叉填充追加的章节引用内容）"
+      }
+    ]
+  },
+  {
+    "scoring_factor": "符合性一致性审查",
+    "score": 54.0,
+    "category": "technical",
+    "expand_as_children": false,
+    "scoring_criteria": "评分细则原文",
+    "chapter_reference": "第五章 二 技术和服务要求",
+    "referenced_content": "（完整章节内容，保留原文）",
+    "source": "scoring_table",
+    "children": []
+  },
+  {
+    "scoring_factor": "培训效果评估及档案材料",
+    "score": 0,
+    "category": "technical",
+    "expand_as_children": true,
+    "scoring_criteria": "",
+    "chapter_reference": "",
+    "referenced_content": "",
+    "source": "chapter_requirements",
+    "children": [
+      {
+        "title": "提供学习资料",
+        "content": "成交供应商须为每位学员免费提供学习资料，包括学习指南、讲课资料、笔记本、文具等。"
+      },
+      {
+        "title": "相关要求",
+        "content": "1）培训项目结束后，配合采购人完成培训推广实施及培训效果评估工作；..."
+      }
+    ]
+  }
+]
+```
+
+# 字段说明
+
+- `source`：条目来源
+  - `"scoring_table"` — 来自评分表的评分因素（原始search_results中的条目）
+  - `"chapter_requirements"` — 来自章节引用内容中未匹配到评分因素的孤立需求
+- 孤立需求条目的`score`为0，`scoring_criteria`为空
+- 其他字段含义与上一步相同
+
+# 注意事项
+
+1. **不丢失内容**：原始search_results中的所有条目必须保留，children.content只追加不覆盖
+2. **不遗漏孤立需求**：referenced_content中的每个条目都必须有归属——要么匹配到某个评分因素，要么作为孤立需求独立输出
+3. **交叉填充要精准**：只在关键词确实相关时才匹配，不要强行关联不相关的内容
+4. **保留原文标记**：原文中的特殊标记（如★、▲、"不可偏离"等）必须原样保留
+5. 只输出JSON数组，不要有其他解释文字
+6. JSON字段值中双引号用中文引号替代
+7. 完整输出，不得省略或缩减
