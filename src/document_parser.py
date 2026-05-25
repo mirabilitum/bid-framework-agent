@@ -124,7 +124,12 @@ class DocumentParser:
     _FORMAT_SECTION_KW = ["投标文件格式", "响应文件格式", "电子投标文件格式", "附件格式"]
     _CHAPTER_KW = ["第七章", "第六章", "第八章", "附件"]
 
-    def extract_format_section_elements(self, start_keyword: Optional[str] = None) -> List[dict]:
+    def extract_format_section_elements(
+        self,
+        start_keyword: Optional[str] = None,
+        start_para_idx: Optional[int] = None,
+        end_para_idx: Optional[int] = None,
+    ) -> List[dict]:
         """
         按文档顺序提取格式章节所有元素（段落+表格）。
 
@@ -147,9 +152,61 @@ class DocumentParser:
         doc = Document(self.file_path)
         body = doc.element.body
 
+        import re as _re
+        def _norm(s: str) -> str:
+            """Normalize whitespace variants (full-width space, tabs, multiple spaces)."""
+            return _re.sub(r'[\s\u3000]+', ' ', s).strip()
+
+        para_map = {p._element: p for p in doc.paragraphs}
+        table_map = {t._element: t for t in doc.tables}
+
+        # ------------------------------------------------------------------ #
+        #  Index-based path (LLM returned exact paragraph indices)
+        # ------------------------------------------------------------------ #
+        if start_para_idx is not None:
+            # Use ONLY top-level body paragraphs for index mapping,
+            # matching the docx_para_list built in bid_framework_agent_v7.py.
+            # doc.paragraphs includes cell-internal paragraphs (inflated indices),
+            # so we enumerate direct }p children of body instead.
+            top_level_paras = [elem for elem in body if elem.tag.endswith('}p')]
+            top_para_idx_map = {elem: i for i, elem in enumerate(top_level_paras)}
+            total = len(top_level_paras)
+
+            s = max(0, int(start_para_idx))
+            e = min(total - 1, int(end_para_idx)) if end_para_idx is not None else total - 1
+
+            result: List[dict] = []
+            last_para_in_range = False  # anchor for table range-gating
+
+            for elem in body:
+                if elem.tag.endswith('}p'):
+                    idx = top_para_idx_map.get(elem)
+                    if idx is None or idx < s:
+                        last_para_in_range = False
+                        continue
+                    if idx > e:
+                        break
+                    last_para_in_range = True
+                    para = para_map.get(elem)
+                    if para is None:
+                        continue
+                    fmt = self._extract_para_format(para)
+                    fmt["type"] = "para"
+                    result.append(fmt)
+                elif elem.tag.endswith('}tbl'):
+                    # Only include table if the preceding paragraph was in range
+                    if last_para_in_range:
+                        tbl = table_map.get(elem)
+                        if tbl is not None:
+                            rows = [[cell.text.strip() for cell in row.cells]
+                                    for row in tbl.rows]
+                            result.append({"type": "table", "rows": rows})
+            return result
+
         # --- Locate section start paragraph ---
         # Must be centered + bold to avoid matching references in 投标须知
         start_elem = None
+        kw_norm = _norm(start_keyword) if start_keyword else None
         for elem in body:
             if elem.tag.endswith('}p'):
                 text = elem.text or ""
@@ -163,17 +220,26 @@ class DocumentParser:
                 if not full_text:
                     continue
 
-                # Check keyword match
+                # Check keyword match (normalize whitespace on both sides)
+                full_text_norm = _norm(full_text)
                 kw_match = False
-                if start_keyword:
-                    kw_match = start_keyword in full_text
+                if kw_norm:
+                    kw_match = kw_norm in full_text_norm
                 else:
-                    kw_match = any(kw in full_text for kw in self._FORMAT_SECTION_KW)
+                    kw_match = any(kw in full_text_norm for kw in self._FORMAT_SECTION_KW)
 
                 if not kw_match:
                     continue
 
-                # Check centered alignment
+                # If start_keyword explicitly provided by LLM, trust it — no need
+                # for bold+centered check (heading style may use inherited formatting
+                # with no explicit XML attributes).
+                if start_keyword:
+                    start_elem = elem
+                    break
+
+                # Without explicit keyword: require centered + bold to avoid
+                # matching incidental references in 投标须知 etc.
                 pPr = elem.find(qn('w:pPr'))
                 jc = None
                 if pPr is not None:
@@ -182,7 +248,6 @@ class DocumentParser:
                         jc = jc_elem.get(qn('w:val'))
                 is_centered = jc == 'center'
 
-                # Check bold
                 is_bold = False
                 for rPr in elem.findall(f'.//{qn("w:rPr")}'):
                     b_elem = rPr.find(qn('w:b'))
@@ -269,15 +334,20 @@ class DocumentParser:
         from docx import Document
         from docx.shared import Emu
 
+        import re as _re
+        def _norm(s: str) -> str:
+            return _re.sub(r'[\s\u3000]+', ' ', s).strip()
+
         doc = Document(self.file_path)
         paragraphs = doc.paragraphs
+        kw_norm = _norm(start_keyword) if start_keyword else None
 
         # --- Locate section start ---
         start_idx = None
         for i, p in enumerate(paragraphs):
-            text = p.text.strip()
-            if start_keyword:
-                if start_keyword in text:
+            text = _norm(p.text)
+            if kw_norm:
+                if kw_norm in text:
                     start_idx = i
                     break
             else:

@@ -15,23 +15,71 @@ To add a custom provider, subclass BaseLLMProvider and register via register_pro
 
 import os
 import json
+import time
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
+
+# Streaming config
+_STREAM_READ_TIMEOUT = 120   # seconds between chunks before stall detected
+_PROGRESS_INTERVAL = 60      # print streaming progress every N seconds
+
+
+def _make_stream_timeout():
+    """Create httpx.Timeout tuned for streaming (short connect, long read for first token)."""
+    import httpx
+    return httpx.Timeout(connect=30.0, read=_STREAM_READ_TIMEOUT,
+                         write=30.0, pool=30.0)
+
+
+def _collect_openai_stream(stream) -> str:
+    """Collect streaming response from OpenAI-compatible API with progress display."""
+    chunks = []
+    total_chars = 0
+    last_print = time.time()
+    start = time.time()
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta and delta.content:
+            chunks.append(delta.content)
+            total_chars += len(delta.content)
+        now = time.time()
+        if now - last_print >= _PROGRESS_INTERVAL:
+            elapsed = int(now - start)
+            print(f"    [streaming] 已收到 {total_chars} 字符 ({elapsed}s)...", flush=True)
+            last_print = now
+
+    return "".join(chunks)
+
+
+def _collect_anthropic_stream(stream) -> str:
+    """Collect streaming response from Anthropic API with progress display."""
+    chunks = []
+    total_chars = 0
+    last_print = time.time()
+    start = time.time()
+
+    for text in stream.text_stream:
+        chunks.append(text)
+        total_chars += len(text)
+        now = time.time()
+        if now - last_print >= _PROGRESS_INTERVAL:
+            elapsed = int(now - start)
+            print(f"    [streaming] 已收到 {total_chars} 字符 ({elapsed}s)...", flush=True)
+            last_print = now
+
+    return "".join(chunks)
 
 
 class BaseLLMProvider(ABC):
     """Abstract base for all LLM providers."""
 
     max_input_chars: int = 30000  # default, subclasses override
+    supports_vision: bool = False  # set True in vision-capable subclasses
 
     @abstractmethod
     def generate(self, prompt: str, max_tokens: int = 4096, **kwargs) -> str:
-        """Send a text prompt and return the model response.
-
-        Optional kwargs:
-            system: str — system prompt. ClaudeProvider caches this for
-                    repeated calls, saving up to 90% input token cost.
-        """
+        """Send a text prompt and return the model response."""
 
     def generate_with_images(
         self, prompt: str, images: Optional[List[dict]] = None, max_tokens: int = 4096, **kwargs
@@ -45,9 +93,10 @@ class BaseLLMProvider(ABC):
 # --------------------------------------------------------------------------- #
 
 class ClaudeProvider(BaseLLMProvider):
-    """Anthropic Claude provider with vision, streaming, and prompt caching."""
+    """Anthropic Claude provider with vision support."""
 
     max_input_chars = 80000  # ~100k token context
+    supports_vision = True
 
     def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-20250514",
                  base_url: Optional[str] = None):
@@ -60,58 +109,41 @@ class ClaudeProvider(BaseLLMProvider):
             )
         self.model = model
         self.base_url = base_url
-        self._client = None  # lazy init, reused for prompt cache hits
 
-    def _get_client(self):
-        """Get or create the Anthropic client (reused across calls for cache hits)."""
-        if self._client is None:
-            import anthropic
-            client_kwargs = {"api_key": self.api_key}
-            if self.base_url:
-                client_kwargs["base_url"] = self.base_url
-            self._client = anthropic.Anthropic(**client_kwargs)
-        return self._client
+    @staticmethod
+    def _extract_text(resp) -> str:
+        """Safely extract text from Anthropic response, ignoring non-text blocks."""
+        for block in resp.content:
+            if hasattr(block, "text"):
+                return block.text
+        raise ValueError(f"No text block in Anthropic response: {resp.content}")
 
     def generate(self, prompt: str, max_tokens: int = 4096, **kwargs) -> str:
-        """Generate with streaming + prompt caching.
+        import anthropic
 
-        Pass system='...' to put shared context (e.g. document text) in a
-        cached system prompt. Subsequent calls with the same system text
-        hit the cache → ~90% cheaper input tokens.
-        """
-        client = self._get_client()
-        system_text = kwargs.get("system")
-
-        create_kwargs = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        # Prompt caching: put shared context in system with cache_control
-        if system_text:
-            create_kwargs["system"] = [{
-                "type": "text",
-                "text": system_text,
-                "cache_control": {"type": "ephemeral"},
-            }]
-
-        # Use streaming to prevent timeout on large outputs
-        with client.messages.stream(**create_kwargs) as stream:
-            resp = stream.get_final_message()
-        if not resp.content:
-            raise RuntimeError(f"Claude returned empty content. stop_reason={resp.stop_reason!r}")
-        return resp.content[0].text
+        client_kwargs = {"api_key": self.api_key, "timeout": _make_stream_timeout()}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        client = anthropic.Anthropic(**client_kwargs)
+        with client.messages.stream(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            return _collect_anthropic_stream(stream)
 
     def generate_with_images(
         self, prompt: str, images: Optional[List[dict]] = None, max_tokens: int = 4096, **kwargs
     ) -> str:
         if not images:
-            return self.generate(prompt, max_tokens=max_tokens, **kwargs)
+            return self.generate(prompt, max_tokens=max_tokens)
 
-        client = self._get_client()
-        system_text = kwargs.get("system")
+        import anthropic
 
+        client_kwargs = {"api_key": self.api_key, "timeout": _make_stream_timeout()}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        client = anthropic.Anthropic(**client_kwargs)
         content: List[Dict[str, Any]] = []
         for img in images:
             content.append({
@@ -120,24 +152,12 @@ class ClaudeProvider(BaseLLMProvider):
             })
         content.append({"type": "text", "text": prompt})
 
-        create_kwargs = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": content}],
-        }
-
-        if system_text:
-            create_kwargs["system"] = [{
-                "type": "text",
-                "text": system_text,
-                "cache_control": {"type": "ephemeral"},
-            }]
-
-        with client.messages.stream(**create_kwargs) as stream:
-            resp = stream.get_final_message()
-        if not resp.content:
-            raise RuntimeError(f"Claude returned empty content. stop_reason={resp.stop_reason!r}")
-        return resp.content[0].text
+        with client.messages.stream(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": content}],
+        ) as stream:
+            return _collect_anthropic_stream(stream)
 
 
 # --------------------------------------------------------------------------- #
@@ -203,16 +223,17 @@ class OpenAIProvider(BaseLLMProvider):
     def generate(self, prompt: str, max_tokens: int = 4096, **kwargs) -> str:
         import openai
 
-        client_kwargs = {"api_key": self.api_key}
+        client_kwargs = {"api_key": self.api_key, "timeout": _make_stream_timeout()}
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
         client = openai.OpenAI(**client_kwargs)
-        resp = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
+            stream=True,
         )
-        return resp.choices[0].message.content
+        return _collect_openai_stream(stream)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,14 +283,15 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         client = openai.OpenAI(
             api_key=self.api_key or "not-needed",
             base_url=self.base_url,
-            timeout=300.0,
+            timeout=_make_stream_timeout(),
         )
-        resp = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
+            stream=True,
         )
-        return resp.choices[0].message.content
+        return _collect_openai_stream(stream)
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +325,7 @@ class QwenProvider(BaseLLMProvider):
                 "input": {"messages": [{"role": "user", "content": prompt}]},
                 "parameters": {"max_tokens": max_tokens},
             },
-            timeout=120,
+            timeout=600,
         )
         resp.raise_for_status()
         return resp.json()["output"]["text"]
@@ -373,6 +395,7 @@ _ALIASES: Dict[str, str] = {
     "kimi": "openai-compatible",
     "moonshot": "openai-compatible",
     "deepseek": "openai-compatible",
+    "doubao": "openai-compatible",
     "gemini": "openai-compatible",
     "ollama": "openai-compatible",
     "local": "openai-compatible",
@@ -383,6 +406,7 @@ _ALIAS_DEFAULTS: Dict[str, Dict[str, str]] = {
     "kimi": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-128k"},
     "moonshot": {"base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-128k"},
     "deepseek": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
+    "doubao": {"base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-pro-128k"},
     "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-2.0-flash"},
     "ollama": {"base_url": "http://localhost:11434/v1", "model": "llama3"},
 }

@@ -1,0 +1,37 @@
+You are doing a lightweight pre-analysis pass over a Chinese government procurement document.
+
+Return JSON only. No markdown. No explanation.
+
+Output schema:
+{
+  "total_lots": 25,
+  "scoring_shared": false,
+  "lot_ranges": [
+    {
+      "range": "1-6",
+      "scoring_section_label": "Exact heading text before the scoring table for lots 1-6",
+      "splittable": false
+    }
+  ],
+  "lots": [
+    {
+      "id": "1",
+      "name": "Lot 1 name",
+      "range": "1-6",
+      "budget": "420000 CNY"
+    }
+  ]
+}
+
+Rules:
+- This is a fast classification step. Be concise. Output only the schema above, nothing else.
+- Identify all lots, packages, or bid sections if present.
+- "scoring_shared": Set to true if the document explicitly states all packages share the SAME scoring criteria, or if there is only 1 lot. Set to false if different packages have independent scoring tables.
+- If the document covers only one lot, set "total_lots": 1 and still return one entry in "lot_ranges".
+- "scoring_section_label" must be the exact heading text immediately before the scoring table for that range.
+- If lot-level splittability cannot be determined, set "splittable": null.
+- Do NOT extract sub-projects, training items, or any detailed line items.
+- Do not invent missing budgets or names.
+
+Document text:
+{document_text}

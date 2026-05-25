@@ -36,6 +36,8 @@ class FrameworkNode:
 class LLMFrameworkGenerator:
     """Generates framework using LLM (3-step split prompts)"""
 
+    JSON_RETRY_SUFFIX = "\n\n【重要】请只输出合法的 JSON 对象，不要输出任何代码、解释或其他内容。"
+
     PROMPT_FILES = [
         "generate_1_skeleton.txt",
         "generate_2_scoring.txt",
@@ -85,27 +87,21 @@ class LLMFrameworkGenerator:
         fmt_templates = analysis_result.get("response_format", {}).get("format_templates", [])
         fmt_json = json.dumps(fmt_templates, ensure_ascii=False, indent=2)
 
-        # Cached system context: analysis data shared across all 3 generation steps.
-        # ClaudeProvider caches this → Steps 2-3 save ~90% input cost on analysis_json.
-        system_context = f"# 分析结果JSON\n\n{analysis_json}"
-
         # --- Step 1: Skeleton ---
         if on_progress:
             on_progress("生成Step1: 构建目录骨架...", 4, 6)
         print("  [1/3] Building skeleton...")
 
         prompt1 = self._prompts["generate_1_skeleton.txt"]
-        # analysis_json is in system_context (cached). Replace placeholder with reference.
-        prompt1 = prompt1.replace("{analysis_json}", "（见system消息中的分析结果JSON）")
+        prompt1 = prompt1.replace("{analysis_json}", analysis_json)
 
-        resp1 = self._call_llm(prompt1, max_tokens=8192, system=system_context)
-        try:
-            skeleton = extract_and_parse_json(resp1, label="skeleton")
-        except Exception as e:
-            raise ValueError(
-                f"Step 1 (skeleton): LLM returned unparseable JSON. "
-                f"Error: {e}. Response (first 200 chars): {resp1[:200]!r}"
-            ) from e
+        skeleton = self._call_and_parse_json(
+            step_no=1,
+            step_name="skeleton",
+            prompt=prompt1,
+            label="skeleton",
+            max_tokens=8192,
+        )
 
         node_count = self._count_json_nodes(skeleton.get("framework", []))
         print(f"    - skeleton nodes: {node_count}")
@@ -120,15 +116,14 @@ class LLMFrameworkGenerator:
         prompt2 = prompt2.replace("{skeleton_json}", skeleton_json)
         prompt2 = prompt2.replace("{scoring_requirements_mapping}", mapping_json)
 
-        resp2 = self._call_llm(prompt2, max_tokens=16384, max_continuations=5,
-                                system=system_context)
-        try:
-            scoring_fw = extract_and_parse_json(resp2, label="scoring")
-        except Exception as e:
-            raise ValueError(
-                f"Step 2 (scoring expansion): LLM returned unparseable JSON. "
-                f"Error: {e}. Response (first 200 chars): {resp2[:200]!r}"
-            ) from e
+        scoring_fw = self._call_and_parse_json(
+            step_no=2,
+            step_name="scoring expansion",
+            prompt=prompt2,
+            label="scoring",
+            max_tokens=16384,
+            max_continuations=5,
+        )
 
         node_count2 = self._count_json_nodes(scoring_fw.get("framework", []))
         print(f"    - after scoring expansion: {node_count2} nodes")
@@ -143,15 +138,14 @@ class LLMFrameworkGenerator:
         prompt3 = prompt3.replace("{framework_json}", scoring_json)
         prompt3 = prompt3.replace("{format_templates}", fmt_json)
 
-        resp3 = self._call_llm(prompt3, max_tokens=16384, max_continuations=5,
-                                system=system_context)
-        try:
-            final_fw = extract_and_parse_json(resp3, label="framework")
-        except Exception as e:
-            raise ValueError(
-                f"Step 3 (content filling): LLM returned unparseable JSON. "
-                f"Error: {e}. Response (first 200 chars): {resp3[:200]!r}"
-            ) from e
+        final_fw = self._call_and_parse_json(
+            step_no=3,
+            step_name="content filling",
+            prompt=prompt3,
+            label="framework",
+            max_tokens=16384,
+            max_continuations=5,
+        )
 
         # Convert to FrameworkNode objects
         framework = self._convert_to_nodes(final_fw.get("framework", []))
@@ -167,12 +161,46 @@ class LLMFrameworkGenerator:
     # ------------------------------------------------------------------
 
     def _call_llm(self, prompt: str, max_tokens: int = 8192,
-                   max_continuations: int = 3, system: str = None) -> str:
+                   max_continuations: int = 3) -> str:
         return call_llm_with_continuation(
             self.llm_provider, prompt,
             max_tokens=max_tokens, max_continuations=max_continuations,
-            system=system,
         )
+
+    def _call_and_parse_json(
+        self,
+        step_no: int,
+        step_name: str,
+        prompt: str,
+        label: str,
+        max_tokens: int,
+        max_continuations: int = 3,
+    ) -> Dict[str, Any]:
+        last_error = None
+        last_response = ""
+
+        for attempt in range(3):
+            prompt_to_use = prompt
+            if attempt > 0:
+                prompt_to_use += self.JSON_RETRY_SUFFIX
+
+            response = self._call_llm(
+                prompt_to_use,
+                max_tokens=max_tokens,
+                max_continuations=max_continuations,
+            )
+            try:
+                return extract_and_parse_json(response, label=label)
+            except Exception as exc:
+                last_error = exc
+                last_response = response
+                if attempt < 2:
+                    print(f"  [WARNING] Step {step_no} JSON解析失败，正在重试({attempt + 1}/2)...")
+
+        raise ValueError(
+            f"Step {step_no} ({step_name}): LLM returned unparseable JSON. "
+            f"Error: {last_error}. Response (first 200 chars): {last_response[:200]!r}"
+        ) from last_error
 
     def _convert_to_nodes(self, framework_list: List[Dict]) -> List[FrameworkNode]:
         nodes = []

@@ -94,26 +94,20 @@ skeleton可能写：
 
 # 输出格式
 
+**单包或scoring_shared=false时**：
 ```json
 {
   "has_chapter_covers": true,
-  "framework": [
-    {
-      "level": 1,
-      "title": "资格及资信证明部分",
-      "content": "",
-      "cover_page": {"title": "XX项目响应文件", "subtitle": "（资格及资信证明部分）", "fields": ["项目名称：", "项目编号："]},
-      "index_page": {"title": "索引", "items": ["一、响应函", "二、供应商的资格及资信证明文件"], "notes": ""},
-      "children": [
-        {
-          "level": 2,
-          "title": "[CENTER]一、响应函",
-          "content": "",
-          "children": []
-        }
-      ]
-    }
-  ]
+  "framework": [ ... ]
+}
+```
+
+**scoring_shared=true（多包共用评分标准）时**，在顶层加 `applicable_packages`，值为packages数组中所有包的id列表：
+```json
+{
+  "applicable_packages": ["1", "2", "3"],
+  "has_chapter_covers": true,
+  "framework": [ ... ]
 }
 ```
 
@@ -125,5 +119,5 @@ skeleton可能写：
 4. 每个节点必须有level、title、content、children四个字段
 5. 只输出JSON，不要有其他解释文字
 6. JSON字段值中双引号用中文引号替代
-7. 多包共用评分标准时（scoring_shared=true），只生成一份框架，顶层添加 `"applicable_packages"` 标注
+7. 多包共用评分标准时（scoring_shared=true），只生成一份通用框架，顶层添加 `"applicable_packages": ["1","2",...]`（从packages数组取所有id），框架内容不按包区分
 8. **DOCX格式内容自动注入**：如果analysis中包含docx_paragraphs字段，is_free_form=false的节点content由程序注入，你只需确保骨架结构正确

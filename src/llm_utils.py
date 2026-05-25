@@ -3,6 +3,8 @@
 Shared LLM call utilities with automatic continuation for truncated output.
 """
 
+import time
+
 
 def call_llm_with_continuation(
     provider,
@@ -10,7 +12,6 @@ def call_llm_with_continuation(
     images=None,
     max_tokens: int = 8192,
     max_continuations: int = 3,
-    system: str = None,
 ) -> str:
     """
     Call LLM and automatically continue if JSON output is truncated.
@@ -21,29 +22,54 @@ def call_llm_with_continuation(
         images: Optional images for vision models
         max_tokens: Max tokens per call
         max_continuations: Max continuation attempts (0 = no continuation)
-        system: Optional system prompt (cached by ClaudeProvider for cost savings)
 
     Returns:
         Complete (or best-effort) LLM response text
     """
-    extra_kwargs = {}
-    if system:
-        extra_kwargs["system"] = system
+    try:
+        import openai  # type: ignore
+        timeout_error_type = openai.APITimeoutError
+    except Exception:
+        timeout_error_type = None
 
-    if images and hasattr(provider, "generate_with_images"):
-        resp = provider.generate_with_images(prompt, images, max_tokens=max_tokens, **extra_kwargs)
+    def is_timeout_error(exc: Exception) -> bool:
+        if timeout_error_type and isinstance(exc, timeout_error_type):
+            return True
+        message = str(exc).lower()
+        return "timeout" in message or "timed out" in message or "readtimeout" in message
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            print(f"    [发送LLM请求... streaming模式]", flush=True)
+            start = time.time()
+            if images and hasattr(provider, "generate_with_images"):
+                resp = provider.generate_with_images(prompt, images, max_tokens=max_tokens)
+            else:
+                resp = provider.generate(prompt, max_tokens=max_tokens)
+            elapsed = int(time.time() - start)
+            print(f"    [LLM响应] 收到 {len(resp)} 字符 (用时 {elapsed}s)", flush=True)
+            break
+        except Exception as exc:
+            last_error = exc
+            if not is_timeout_error(exc) or attempt >= 2:
+                raise
+            print(f"  [WARNING] LLM 请求超时/中断，正在重试({attempt + 1}/2)...", flush=True)
     else:
-        resp = provider.generate(prompt, max_tokens=max_tokens, **extra_kwargs)
+        raise last_error
 
     for attempt in range(max_continuations):
         if json_looks_complete(resp):
             break
-        print(f"    - output truncated, continuing ({attempt+1}/{max_continuations})...")
+        print(f"    - [续写] 输出被截断，正在发起续写请求 ({attempt+1}/{max_continuations})...", flush=True)
+        print(f"    - [续写] 当前响应长度: {len(resp)} 字符", flush=True)
         cont_prompt = (
             "你的上一次输出被截断了，请从截断处继续输出（不要重复已输出的内容）。"
             f"\n\n已输出的末尾：\n...{resp[-500:]}"
         )
-        cont = provider.generate(cont_prompt, max_tokens=max_tokens, **extra_kwargs)
+        print(f"    [发送续写请求... streaming模式]", flush=True)
+        cont = provider.generate(cont_prompt, max_tokens=max_tokens)
+        print(f"    - [续写] 收到续写响应: {len(cont)} 字符", flush=True)
         # Strip any preamble text before the JSON continuation fragment
         first_json_char = len(cont)
         for i, ch in enumerate(cont):
@@ -54,8 +80,9 @@ def call_llm_with_continuation(
     else:
         # Loop exhausted without break — JSON still incomplete
         if max_continuations > 0 and not json_looks_complete(resp):
-            print(f"    - [WARNING] JSON still incomplete after {max_continuations} continuations")
+            print(f"    - [WARNING] JSON经过{max_continuations}次续写仍不完整（总长度: {len(resp)} 字符）", flush=True)
 
+    print(f"    [LLM完成] 最终响应: {len(resp)} 字符, JSON完整: {json_looks_complete(resp)}", flush=True)
     return resp
 
 
